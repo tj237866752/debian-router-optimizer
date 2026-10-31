@@ -708,4 +708,14 @@ main_menu() {
 # ----------------------------------------------------------
 
 check_system
+
+# 安装 aaa 快捷启动命令
+if [[ ! -f /usr/local/bin/aaa ]]; then
+    cat > /usr/local/bin/aaa <<'EOF'
+#!/bin/bash
+bash <(curl -fsSL https://raw.githubusercontent.com/tj237866752/debian-router-optimizer/main/install.sh)
+EOF
+    chmod +x /usr/local/bin/aaa
+fi
+
 main_menu
