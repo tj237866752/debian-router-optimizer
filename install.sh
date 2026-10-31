@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 # ==========================================================
 # Debian 13 Router Optimizer
@@ -11,6 +12,8 @@ CONFIG="/etc/sysctl.d/99zz-router-stable.conf"
 STATE="/var/lib/debian-router-optimizer"
 BACKUP_ROOT="/root/debian-router-backups"
 SCRIPT_NAME="Debian Router Optimizer"
+
+CONNTRACK_SUPPORTED=0
 
 OLD_FILES=(
     "/etc/sysctl.d/99-ip-forward.conf"
@@ -48,6 +51,37 @@ check_system() {
             exit 1
         }
     done
+}
+
+# ----------------------------------------------------------
+# Conntrack 检测与加载
+# ----------------------------------------------------------
+
+detect_conntrack() {
+    CONNTRACK_SUPPORTED=0
+
+    # 参数不存在时尝试加载内核模块
+    if [[ ! -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+        if command -v modprobe >/dev/null 2>&1; then
+            echo "正在检测 nf_conntrack 模块……"
+
+            if ! modprobe nf_conntrack 2>/dev/null; then
+                echo "[跳过] nf_conntrack 模块加载失败。"
+                return 0
+            fi
+        else
+            echo "[跳过] 系统没有 modprobe 命令。"
+            return 0
+        fi
+    fi
+
+    # 再次确认参数文件是否存在
+    if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+        CONNTRACK_SUPPORTED=1
+        echo "[正常] nf_conntrack 模块已加载。"
+    else
+        echo "[跳过] 当前内核没有提供 nf_conntrack_max 参数。"
+    fi
 }
 
 # ----------------------------------------------------------
@@ -101,6 +135,11 @@ lock_config() {
             echo "文件保护启用失败。"
             return 1
         fi
+
+        if ! lsattr -d "$CONFIG" 2>/dev/null | awk '{print $1}' | grep -q i; then
+            echo "文件保护验证失败。"
+            return 1
+        fi
     fi
 }
 
@@ -117,7 +156,6 @@ create_backup() {
     mkdir -p "$BACKUP_DIR/files"
 
     local file
-
     for file in "$CONFIG" "${OLD_FILES[@]}" /etc/sysctl.conf; do
         if [[ -f "$file" ]]; then
             mkdir -p "$BACKUP_DIR/files$(dirname "$file")"
@@ -208,9 +246,18 @@ net.ipv4.tcp_max_syn_backlog = 8192
 # Local port range
 net.ipv4.ip_local_port_range = 10240 65535
 
+EOF
+
+            # 只有模块加载成功才写入该参数
+            if [[ "$CONNTRACK_SUPPORTED" == "1" ]]; then
+                cat <<EOF
 # Connection tracking
 net.netfilter.nf_conntrack_max = 262144
 
+EOF
+            fi
+
+            cat <<EOF
 # Neighbor table
 net.ipv4.neigh.default.gc_thresh1 = 1024
 net.ipv4.neigh.default.gc_thresh2 = 4096
@@ -284,7 +331,6 @@ show_status() {
     )
 
     local key
-
     for key in "${keys[@]}"; do
         printf "%-45s " "$key"
         sysctl -n "$key" 2>/dev/null || echo "不可用"
@@ -305,6 +351,7 @@ show_status() {
     echo
     echo "sing-box 状态："
     systemctl is-active sing-box 2>/dev/null || true
+
     echo "=================================="
 }
 
@@ -325,12 +372,13 @@ install_config() {
 
     echo "默认出口网卡：$DEFAULT_IF"
     echo "检测到 TUN：${TUN_IFS[*]:-无}"
-
     echo
+
     echo "IPv4 转发："
     echo "1. 开启"
     echo "2. 关闭"
     read -r -p "请选择 [默认 1]：" choice
+
     local IPV4=1
     [[ "$choice" == "2" ]] && IPV4=0
 
@@ -339,6 +387,7 @@ install_config() {
     echo "1. 开启"
     echo "2. 关闭"
     read -r -p "请选择 [默认 2]：" choice
+
     local IPV6=0
     [[ "$choice" == "1" ]] && IPV6=1
 
@@ -347,6 +396,7 @@ install_config() {
     echo "1. 开启"
     echo "2. 关闭"
     read -r -p "请选择 [默认 1]：" choice
+
     local BBR=1
     [[ "$choice" == "2" ]] && BBR=0
 
@@ -355,6 +405,7 @@ install_config() {
     echo "1. 开启"
     echo "2. 关闭"
     read -r -p "请选择 [默认 1]：" choice
+
     local TUNING=1
     [[ "$choice" == "2" ]] && TUNING=0
 
@@ -365,12 +416,20 @@ install_config() {
     echo "BBR + fq：$([[ "$BBR" == 1 ]] && echo 开启 || echo 关闭)"
     echo "网络参数优化：$([[ "$TUNING" == 1 ]] && echo 开启 || echo 关闭)"
     echo
+
     read -r -p "输入 YES 确认安装：" confirm
 
     [[ "$confirm" == "YES" ]] || {
         echo "已取消。"
         return
     }
+
+    # 先检测 conntrack，再生成配置
+    if [[ "$TUNING" == "1" ]]; then
+        detect_conntrack
+    else
+        CONNTRACK_SUPPORTED=0
+    fi
 
     create_backup >/dev/null
     echo "备份位置：$BACKUP_DIR"
@@ -403,19 +462,25 @@ install_config() {
     verify_value net.ipv4.conf.all.rp_filter 0 || failed=1
     verify_value net.ipv4.conf.default.rp_filter 0 || failed=1
 
-    if [[ "$BBR" == 1 ]]; then
+    if [[ "$BBR" == "1" ]]; then
         verify_value net.core.default_qdisc fq || failed=1
         verify_value net.ipv4.tcp_congestion_control bbr || failed=1
     fi
 
-    if [[ "$TUNING" == 1 ]]; then
+    if [[ "$TUNING" == "1" ]]; then
         verify_value net.core.rmem_default 16777216 || failed=1
         verify_value net.core.rmem_max 33554432 || failed=1
         verify_value net.core.wmem_max 16777216 || failed=1
         verify_value net.core.netdev_max_backlog 16384 || failed=1
         verify_value net.core.somaxconn 4096 || failed=1
         verify_value net.ipv4.tcp_max_syn_backlog 8192 || failed=1
-        verify_value net.netfilter.nf_conntrack_max 262144 || failed=1
+
+        if [[ "$CONNTRACK_SUPPORTED" == "1" ]]; then
+            verify_value net.netfilter.nf_conntrack_max 262144 || failed=1
+        else
+            echo "[跳过] net.netfilter.nf_conntrack_max（模块不可用）"
+        fi
+
         verify_value fs.file-max 1048576 || failed=1
     fi
 
@@ -485,12 +550,21 @@ modify_forwarding() {
     read -r -p "输入 YES 确认修改：" confirm
     [[ "$confirm" == "YES" ]] || return
 
+    if [[ "$TUNING" == "1" ]]; then
+        detect_conntrack
+    else
+        CONNTRACK_SUPPORTED=0
+    fi
+
     create_backup >/dev/null
     unlock_config
 
     generate_config "$IPV4" "$IPV6" "$BBR" "$TUNING"
 
-    sysctl --system
+    if ! sysctl --system; then
+        echo "配置加载失败，请检查配置文件。"
+        return 1
+    fi
 
     if verify_value net.ipv4.ip_forward "$IPV4" &&
        verify_value net.ipv6.conf.all.forwarding "$IPV6"; then
@@ -603,6 +677,7 @@ main_menu() {
         echo "  7. 卸载本脚本配置"
         echo "  0. 退出"
         echo
+
         read -r -p "请选择：" choice
 
         case "$choice" in
